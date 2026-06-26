@@ -40,7 +40,17 @@ from .utils import (
     parse_timestamp,
 )
 
+# Suspicious contact-channel cues: a complaint that asks the agent to call
+# back a non-official number, or to email an address the customer supplied,
+# is a classic fraud pattern. We surface it as a reason_code only (the
+# routing/severity are already handled by the phishing cascade when present).
+_SUSPICIOUS_CHANNEL_CUES = [
+    "call me at", "call back at", "email me at", "send to", "mail to",
+    "contact me on", "reach me at", "এই নম্বরে কল", "এই নম্বরে যোগাযোগ",
+]
+
 HIGH_VALUE_THRESHOLD = 5000.0  # BDT; tunable, matches problem-statement guidance
+EXTRA_HIGH_VALUE_THRESHOLD = 50000.0  # BDT; bumps severity a tier for huge claims
 
 # ---------------------------------------------------------------------------
 # Keyword banks (English + Banglish + Bangla script)
@@ -198,7 +208,16 @@ def _most_recent(txns: List[TransactionHistoryEntry]):
 
 
 def _distinct_counterparties(txns: List[TransactionHistoryEntry]) -> int:
-    return len({(t.counterparty or "").strip() for t in txns if t.counterparty})
+    """Count unique counterparties with phone numbers normalised, so
+    01712345678 and +8801712345678 collapse to the same recipient."""
+    seen = set()
+    for t in txns:
+        cp = (t.counterparty or "").strip()
+        if not cp:
+            continue
+        key = normalize_phone(cp) if cp else cp
+        seen.add(key)
+    return len(seen)
 
 
 # ---------------------------------------------------------------------------
@@ -267,8 +286,20 @@ def _investigate_wrong_transfer(txns, amounts, phones):
 
     # Established-recipient check: repeated transfers to the same counterparty
     # contradict a "wrong recipient" claim (SAMPLE-02 behaviour).
+    # Phone numbers are normalised to last-10-digits so 01712345678 and
+    # +8801712345678 compare equal.
     cp = (candidate.counterparty or "").strip()
-    same_cp = [t for t in transfers if (t.counterparty or "").strip() == cp and cp]
+    cp_norm = normalize_phone(cp) if cp else None
+
+    def _same_recipient(t):
+        other = (t.counterparty or "").strip()
+        if not other:
+            return False
+        if cp_norm:
+            return normalize_phone(other) == cp_norm
+        return other == cp
+
+    same_cp = [t for t in transfers if _same_recipient(t)]
     if len(same_cp) >= 2:
         return candidate, "inconsistent", [
             "wrong_transfer_claim", "established_recipient_pattern", "evidence_inconsistent"
@@ -281,9 +312,17 @@ def _investigate_payment_failed(txns, amounts):
     pool = payments or txns
     amount_hits = _by_amount(pool, amounts) if amounts else pool
 
+    # A failed payment is the textbook "balance deducted, item not delivered"
+    # case -> consistent.
     failed = [t for t in amount_hits if (t.status or "").lower() == "failed"]
     if failed:
         return _most_recent(failed), "consistent", ["payment_failed", "potential_balance_deduction"]
+
+    # A pending payment also means the customer's money has not yet resolved,
+    # so a "failed but deducted" complaint is supported.
+    pending = [t for t in amount_hits if (t.status or "").lower() == "pending"]
+    if pending:
+        return _most_recent(pending), "consistent", ["payment_failed", "pending_payment", "potential_balance_deduction"]
 
     if amount_hits:
         # Claimed failure but the matching transaction completed -> contradiction.
@@ -386,20 +425,32 @@ def _investigate_cash_in(txns, amounts):
 # ---------------------------------------------------------------------------
 # 4. Routing / grading / escalation
 # ---------------------------------------------------------------------------
+_SEVERITY_RANK = {"low": 0, "medium": 1, "high": 2, "critical": 3}
+
+
+def _bump_severity(sev: str, amount: Optional[float]) -> str:
+    """Upgrade severity by one tier for very high-value claims."""
+    if amount is not None and amount >= EXTRA_HIGH_VALUE_THRESHOLD:
+        upgraded = {"low": "medium", "medium": "high", "high": "critical", "critical": "critical"}
+        return upgraded[sev]
+    return sev
+
+
 def _severity_for(case_type: str, verdict: str, amount: Optional[float]) -> str:
     if case_type == "phishing_or_social_engineering":
         return "critical"
     if case_type == "wrong_transfer":
         return "high" if verdict == "consistent" else "medium"
     if case_type in ("payment_failed", "duplicate_payment", "agent_cash_in_issue"):
-        return "high"
+        return _bump_severity("high", amount)
     if case_type == "merchant_settlement_delay":
         return "medium"
     if case_type == "refund_request":
         if amount is not None and amount >= HIGH_VALUE_THRESHOLD:
             return "medium"
         return "low"
-    return "low"  # other
+    sev = "low"  # other
+    return _bump_severity(sev, amount)
 
 
 def _department_for(case_type: str, severity: str) -> str:
@@ -417,7 +468,7 @@ def _department_for(case_type: str, severity: str) -> str:
     return mapping.get(case_type, "customer_support")
 
 
-def _human_review_for(case_type, severity, verdict, relevant_id) -> bool:
+def _human_review_for(case_type, severity, verdict, relevant_id, reason_codes=None) -> bool:
     if case_type == "phishing_or_social_engineering":
         return True
     if case_type == "wrong_transfer":
@@ -430,7 +481,15 @@ def _human_review_for(case_type, severity, verdict, relevant_id) -> bool:
         return severity in ("high", "critical")
     if case_type in ("payment_failed", "merchant_settlement_delay"):
         return verdict == "inconsistent"
-    return False  # other
+    # Vague "other" complaints with risk signals (contact-channel request,
+    # suspicious third party) escalate; clean vague cases match the reference
+    # (SAMPLE-06: human_review_required == false).
+    if case_type == "other" and reason_codes:
+        risky = {"suspicious_contact_channel_requested",
+                 "suspicious_third_party_mentioned",
+                 "needs_clarification"}
+        return bool(set(reason_codes) & risky) or verdict == "inconsistent"
+    return False
 
 
 def _confidence_for(case_type, verdict, relevant_id, reason_codes) -> float:
@@ -660,7 +719,6 @@ def analyze(req: AnalyzeRequest) -> dict:
 
     severity = _severity_for(case_type, verdict, amount_for_grade)
     department = _department_for(case_type, severity)
-    human_review = _human_review_for(case_type, severity, verdict, relevant_id)
     confidence = _confidence_for(case_type, verdict, relevant_id, reason_codes)
 
     agent_summary = _agent_summary(case_type, txn, verdict, amounts)
@@ -670,6 +728,17 @@ def analyze(req: AnalyzeRequest) -> dict:
     # Defence-in-depth safety pass (also neutralises prompt injection effects).
     if detect_prompt_injection(raw):
         reason_codes = list(reason_codes) + ["prompt_injection_ignored"]
+    # Flag suspicious contact-channel requests (asking the agent to call back
+    # an external number / external email) as a reason_code for auditability.
+    if any(cue in raw.lower() for cue in _SUSPICIOUS_CHANNEL_CUES):
+        reason_codes = list(reason_codes) + ["suspicious_contact_channel_requested"]
+
+    # Recompute human-review AFTER audit/safety flags are appended so risky
+    # vague complaints (e.g. ask-to-call-back) are correctly escalated.
+    human_review = _human_review_for(
+        case_type, severity, verdict, relevant_id, reason_codes
+    )
+
     customer_reply = sanitize_customer_reply(customer_reply, language)
     next_action = sanitize_internal_text(next_action)
     agent_summary = sanitize_internal_text(agent_summary)

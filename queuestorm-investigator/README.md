@@ -364,10 +364,16 @@ these set.
 |----------|---------|---------|
 | `PORT` | `8000` | Port to bind (always binds `0.0.0.0`). |
 | `LOG_LEVEL` | `INFO` | Log verbosity. |
-| `USE_LLM` | `0` | Set to `1` to enable optional tone-polish of the (already safe) reply. |
+| `REQUEST_TIMEOUT_S` | `25` | Wall-clock cap on a single `/analyze-ticket` request (seconds). |
+| `REQUEST_MAX_BYTES` | `32768` | Maximum accepted request body size (bytes). |
+| `USE_LLM` | `0` | Set to `1` to enable optional tone-polish via the OpenAI provider. |
 | `OPENAI_API_KEY` | _(empty)_ | Required only if `USE_LLM=1`. Provide via host env or the private judging field — never in the repo. |
-| `MODEL_NAME` | `gpt-4o-mini` | Model used only when LLM polish is enabled. |
-| `LLM_TIMEOUT` | `8` | Seconds before the optional LLM call gives up and falls back. |
+| `MODEL_NAME` | `gpt-4o-mini` | Model used only when OpenAI polish is enabled. |
+| `HF_TOKEN` | _(empty)_ | Hugging Face token. Enables the optional Qwen auditor/polish layer. |
+| `HF_MODEL` | `Qwen/Qwen2.5-7B-Instruct` | Model used by the optional Qwen auditor/polish. |
+| `USE_LLM_PROVIDER` | `openai` | Set to `qwen` to route tone polish through Qwen instead of OpenAI. |
+| `LLM_AUDIT` | `1` | When `1` and `HF_TOKEN` is set, Qwen audits the rule verdict (`llm_audit_agrees` / `llm_audit_disagrees`). |
+| `LLM_TIMEOUT` | `6` | Seconds before an HF call gives up and falls back silently. |
 
 ## MODELS
 
@@ -375,8 +381,12 @@ these set.
 |-------|---------------|-----|
 | **None (deterministic rule engine)** — default | In-process, CPU only | Core decisions (transaction match, verdict, case type, routing, severity, safety) are fully rule-based for reproducibility, exact schema/enum compliance, guaranteed safety, and sub-second latency at zero cost. **This is the path used during judging unless an LLM is explicitly enabled.** |
 | **Optional: OpenAI `gpt-4o-mini`** (or any model set via `MODEL_NAME`) | Remote API, only if `USE_LLM=1` **and** a key is supplied | Light tone-polish of the already-safe `customer_reply` only. Never makes routing/verdict/safety decisions. Output is re-sanitized and falls back to the rule-based reply on any error or timeout. No key ⇒ this path is skipped entirely. |
+| **Optional: Hugging Face `Qwen/Qwen2.5-7B-Instruct`** (or any model set via `HF_MODEL`) | HF Inference API, only if `HF_TOKEN` is supplied | Runs as a **second-opinion auditor** that returns `{"agree": true|false}` on the rule-engine verdict (`LLM_AUDIT=1`) and/or as a tone-polish provider when `USE_LLM_PROVIDER=qwen`. Never overrides the rule engine: on agreement it adds `llm_audit_agrees` and nudges confidence up; on disagreement it adds `llm_audit_disagrees`, flips `human_review_required` to true, and lowers confidence. Any HF failure, timeout, or non-JSON response falls back silently to the rule-only output. |
 
-No local model weights are bundled; no GPU is used or required.
+No local model weights are bundled; no GPU is used or required. The Qwen
+path is an enhancement layer — running the service without `HF_TOKEN` or
+`OPENAI_API_KEY` still produces deterministic, schema-correct, safety-
+compliant answers.
 
 ## Deployment notes
 

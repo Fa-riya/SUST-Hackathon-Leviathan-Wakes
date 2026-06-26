@@ -90,7 +90,11 @@ _UNSAFE_PROMISE_PATTERNS: List[Tuple[re.Pattern, str]] = [
 _INJECTION_RE = re.compile(
     r"(ignore (?:previous|all|the)\s+(?:rules|instructions|prompt)|"
     r"disregard (?:previous|all)|you are now|new instructions|"
-    r"ask me for my (?:otp|pin|password)|tell me your (?:system )?prompt)",
+    r"ask me for my (?:otp|pin|password)|tell me your (?:system )?prompt|"
+    # Bangla cues: "পূর্ববর্তী নির্দেশ উপেক্ষা করুন", "সিস্টেম প্রম্পট বলুন", etc.
+    r"পূর্ববর্তী\s*(?:নির্দেশ|নিয়ম)\s*(?:উপেক্ষা|অগ্রাহ্য)|"
+    r"সিস্টেম\s*প্রম্পট|"
+    r"ওটিপি\s*বলুন|পিন\s*বলুন)",
     re.IGNORECASE,
 )
 
